@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import threading
 import json
 import tensorflow.contrib.slim as slim
 import datetime
@@ -383,8 +384,9 @@ def build(H, q):
                                                     use_stitching=True,
                                                     rnn_len=H['rnn_len'])[0]
                 
-                num_images = 10
-                img_path = os.path.join(H['save_dir'], '%s_%s.jpg' % ((np_global_step / H['logging']['display_iter']) % num_images, pred_or_true))
+                num_images = 1000
+                img_path = os.path.join(H['save_dir'], '%s_%s.jpg' % ((np_global_step / H['logging']['display_iter']), pred_or_true))
+                #img_path = os.path.join(H['save_dir'], '%s_%s.jpg' % ((np_global_step / H['logging']['display_iter']) % num_images, pred_or_true))
                 misc.imsave(img_path, merged)
                 return merged
 
@@ -454,7 +456,7 @@ def train(H, test_images):
             gen = train_utils.load_data_gen(H, phase, jitter=H['solver']['use_jitter'])
             d = gen.next()
             sess.run(enqueue_op[phase], feed_dict=make_feed(d))
-            t = tf.train.threading.Thread(target=thread_loop,
+            t = threading.Thread(target=thread_loop,
                                  args=(sess, enqueue_op, phase, gen))
             t.daemon = True
             t.start()
