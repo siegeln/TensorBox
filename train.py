@@ -1,4 +1,9 @@
 #!/usr/bin/env python
+import os
+import sys
+# Apparently train_utils assumes /utils/ is on the python path?
+sys.path.append(os.path.realpath(os.path.dirname(os.path.abspath(__file__)) + '/utils/'))
+
 import json
 import cv2
 import tensorflow.contrib.slim as slim
@@ -360,11 +365,13 @@ def build(H, q):
 
             def log_image(np_img, np_confidences, np_boxes, np_global_step, pred_or_true):
 
+                if np_img.shape[2] == 4:
+                    np_img = np_img[:,:,[0,1,3]]
                 merged = train_utils.add_rectangles(H, np_img, np_confidences, np_boxes,
                                                     use_stitching=True,
                                                     rnn_len=H['rnn_len'])[0]
 
-                num_images = 10
+                num_images = 5000
                 img_path = os.path.join(H['save_dir'], '%s_%s.jpg' % ((np_global_step / H['logging']['display_iter']) % num_images, pred_or_true))
                 misc.imsave(img_path, merged)
                 return merged
@@ -403,8 +410,10 @@ def train(H, test_images):
     for phase in ['train', 'test']:
         dtypes = [tf.float32, tf.float32, tf.float32]
         grid_size = H['grid_width'] * H['grid_height']
+        channels = H.get('image_channels', 3)
+        print('Image channels: %d' % channels)
         shapes = (
-            [H['image_height'], H['image_width'], 3],
+            [H['image_height'], H['image_width'], channels],
             [grid_size, H['rnn_len'], H['num_classes']],
             [grid_size, H['rnn_len'], 4],
             )
@@ -433,7 +442,7 @@ def train(H, test_images):
         for phase in ['train', 'test']:
             # enqueue once manually to avoid thread start delay
             gen = train_utils.load_data_gen(H, phase, jitter=H['solver']['use_jitter'])
-            d = gen.next()
+            d = next(gen)
             sess.run(enqueue_op[phase], feed_dict=make_feed(d))
             t = threading.Thread(target=thread_loop,
                                  args=(sess, enqueue_op, phase, gen))
@@ -447,6 +456,10 @@ def train(H, test_images):
         if len(weights_str) > 0:
             print('Restoring from: %s' % weights_str)
             saver.restore(sess, weights_str)
+        elif H['slim_ckpt'] == '':
+            #https://github.com/tensorflow/models/blob/7ff111ab514df86def76ee5140769b9edb51afd1/slim/nets/resnet_utils.py#L242
+            init_fn = slim.variance_scaling_initializer()
+            sess.run(tf.variables_initializer([x for x in tf.global_variables() if x.name.startswith(H['slim_basename']) and H['solver']['opt'] not in x.name]))
         else:
             init_fn = slim.assign_from_checkpoint_fn(
                   '%s/data/%s' % (os.path.dirname(os.path.realpath(__file__)), H['slim_ckpt']),
@@ -459,7 +472,7 @@ def train(H, test_images):
         # train model for N iterations
         start = time.time()
         max_iter = H['solver'].get('max_iter', 10000000)
-        for i in xrange(max_iter):
+        for i in range(max_iter):
             display_iter = H['logging']['display_iter']
             adjusted_lr = (H['solver']['learning_rate'] *
                            0.5 ** max(0, (i / H['solver']['learning_rate_step']) - 2))
@@ -478,13 +491,13 @@ def train(H, test_images):
                                       summary_op, train_op, smooth_op,
                                      ], feed_dict=lr_feed)
                 writer.add_summary(summary_str, global_step=global_step.eval())
-                print_str = string.join([
+                print_str = ', '.join([
                     'Step: %d',
                     'lr: %f',
                     'Train Loss: %.2f',
                     'Softmax Test Accuracy: %.1f%%',
-                    'Time/image (ms): %.1f'
-                ], ', ')
+                    'Time/image (ms): %.1f',
+                ])
                 print(print_str %
                       (i, adjusted_lr, train_loss,
                        test_accuracy * 100, dt * 1000 if i > 0 else 0))

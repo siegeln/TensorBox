@@ -6,11 +6,23 @@ import cv2
 import itertools
 from scipy.misc import imread, imresize
 import tensorflow as tf
+import multiprocessing
+import multiprocessing.pool
+import queue
 
 from data_utils import (annotation_jitter, annotation_to_h5)
 from utils.annolist import AnnotationLib as al
 from rect import Rect
 from utils import tf_concat
+from utils.stitch_wrapper import stitch_rects
+import functools
+
+import sys
+sys.path.append('/home/noahs/Dropbox/ai2/scholar-research/base')
+sys.path.append('/home/noahs/repos/scholar-research/base')
+from base import image_util
+tensor_queue=multiprocessing.Queue(maxsize=8)
+
 
 def rescale_boxes(current_shape, anno, target_height, target_width):
     x_scale = target_width / float(current_shape[1])
@@ -39,36 +51,51 @@ def load_idl_tf(idlfile, H, jitter):
     if H['data']['truncate_data']:
         annos = annos[:10]
     for epoch in itertools.count():
+        print('Starting epoch %d' % epoch)
         random.shuffle(annos)
-        for anno in annos:
-            I = imread(anno.imageName)
-	    #Skip Greyscale images
-            if len(I.shape) < 3:
-                continue
-            if I.shape[2] == 4:
-                I = I[:, :, :3]
-            if I.shape[0] != H["image_height"] or I.shape[1] != H["image_width"]:
-                if epoch == 0:
-                    anno = rescale_boxes(I.shape, anno, H["image_height"], H["image_width"])
-                I = imresize(I, (H["image_height"], H["image_width"]), interp='cubic')
-            if jitter:
-                jitter_scale_min=0.9
-                jitter_scale_max=1.1
-                jitter_offset=16
-                I, anno = annotation_jitter(I,
-                                            anno, target_width=H["image_width"],
-                                            target_height=H["image_height"],
-                                            jitter_scale_min=jitter_scale_min,
-                                            jitter_scale_max=jitter_scale_max,
-                                            jitter_offset=jitter_offset)
+        partial_load = functools.partial(load_page_ann, H=H, epoch=epoch, jitter=jitter)
+        with multiprocessing.pool.ThreadPool(processes=4) as p:
+            map_result = p.map_async(partial_load, annos)
+            while not map_result.ready():
+                try:
+                    yield tensor_queue.get(timeout=100)
+                except queue.Empty:#multiprocessing.TimeoutError: # TODO: find timeout exception
+                    pass
+            while not tensor_queue.empty():
+                yield tensor_queue.get()
 
-            boxes, flags = annotation_to_h5(H,
-                                            anno,
-                                            H["grid_width"],
-                                            H["grid_height"],
-                                            H["rnn_len"])
 
-            yield {"image": I, "boxes": boxes, "flags": flags}
+def load_page_ann(anno, H, epoch, jitter) -> None:
+    try:
+        I = image_util.read_tensor(anno.imageName, maxsize=1e8)
+    except image_util.FileTooLargeError:
+        print('ERROR: %s too large' % anno.imageName, flush=True)
+        return
+    if I is None:
+        print("ERROR: Failure reading %s" % anno.imageName, flush=True)
+        return  # TODO: figure out why this happens
+    assert (len(I.shape) == 3)
+    if I.shape[0] != H["image_height"] or I.shape[1] != H["image_width"]:
+        if epoch == 0:
+            anno = rescale_boxes(I.shape, anno, H["image_height"], H["image_width"])
+        I = image_util.imresize_multichannel(I, (H["image_height"], H["image_width"]), interp='cubic')
+    if jitter:
+        jitter_scale_min = 0.9
+        jitter_scale_max = 1.1
+        jitter_offset = 16
+        I, anno = annotation_jitter(I,
+                                    anno, target_width=H["image_width"],
+                                    target_height=H["image_height"],
+                                    jitter_scale_min=jitter_scale_min,
+                                    jitter_scale_max=jitter_scale_max,
+                                    jitter_offset=jitter_offset)
+    boxes, flags = annotation_to_h5(H,
+                                    anno,
+                                    H["grid_width"],
+                                    H["grid_height"],
+                                    H["rnn_len"])
+    tensor_queue.put({"image": I, "boxes": boxes, "flags": flags})
+
 
 def make_sparse(n, d):
     v = np.zeros((d,), dtype=np.float32)
@@ -124,7 +151,6 @@ def add_rectangles(H, orig_image, confidences, boxes, use_stitching=False, rnn_l
 
     all_rects_r = [r for row in all_rects for cell in row for r in cell]
     if use_stitching:
-        from stitch_wrapper import stitch_rects
         acc_rects = stitch_rects(all_rects, tau)
     else:
         acc_rects = all_rects_r
@@ -139,8 +165,8 @@ def add_rectangles(H, orig_image, confidences, boxes, use_stitching=False, rnn_l
         for rect in rect_set:
             if rect.confidence > min_conf:
                 cv2.rectangle(image,
-                    (rect.cx-int(rect.width/2), rect.cy-int(rect.height/2)),
-                    (rect.cx+int(rect.width/2), rect.cy+int(rect.height/2)),
+                    (int(rect.cx-int(rect.width/2)), int(rect.cy-int(rect.height/2))),
+                    (int(rect.cx+int(rect.width/2)), int(rect.cy+int(rect.height/2))),
                     color,
                     2)
 
